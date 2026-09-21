@@ -37,11 +37,22 @@ def log(message: str) -> None:
 # ---------------------------------------------------------------------------
 
 def discover_dana_skus(store: Store) -> int:
-    """Scrape DANA catalog pages and upsert the canonical SKU catalog.
+    """Scrape DANA catalog pages: upsert SKUs AND write DANA price logs.
+
+    DANA price logs are what the comparison/alert logic reads, so they must
+    exist even when the SKU catalog is already populated.
 
     Returns the number of SKUs upserted.
     """
     games = store.get_games()
+    dana_source = next(
+        (s for s in store.get_sources() if s.get("source_type") == "dana"),
+        None,
+    )
+    if dana_source is None:
+        log("WARN: no DANA source configured; skipping discovery")
+        return 0
+
     count = 0
     for game in games:
         dana_url = game.get("dana_url")
@@ -65,7 +76,7 @@ def discover_dana_skus(store: Store) -> int:
             if not package.get("base_units"):
                 continue  # cannot catalogue a package without unit counts
             sku_code = f"{game['slug']}-{package['base_units']}{'+' + str(package['bonus_units']) if package.get('bonus_units') else ''}"
-            store.upsert_game_sku(
+            sku = store.upsert_game_sku(
                 game["id"],
                 {
                     "sku_code": sku_code,
@@ -77,6 +88,30 @@ def discover_dana_skus(store: Store) -> int:
             )
             count += 1
             log(f"Upserted SKU {sku_code}: IDR {package['total_price']}")
+
+            # Record the DANA price log for this SKU (comparison baseline).
+            if sku is not None:
+                eup = effective_unit_price(
+                    package["total_price"], package["base_units"], package.get("bonus_units", 0)
+                )
+                store.insert_price_log(
+                    {
+                        "sku_id": sku["id"],
+                        "game_id": game["id"],
+                        "source_id": dana_source["id"],
+                        "product_name": package.get("product_name") or sku_code,
+                        "total_price": float(package["total_price"]),
+                        "currency": "IDR",
+                        "base_units": package["base_units"],
+                        "bonus_units": package.get("bonus_units", 0),
+                        "effective_units": package["base_units"] + package.get("bonus_units", 0),
+                        "effective_unit_price": float(eup) if eup is not None else None,
+                        "matched": True,
+                        "scrape_status": "success",
+                        "parser_method": "dana_catalog",
+                        "source_url": dana_url,
+                    }
+                )
         time.sleep(REQUEST_DELAY_SECONDS)
     return count
 
@@ -155,11 +190,13 @@ def scrape_mapping(store: Store, mapping: dict, skus: list[dict]) -> dict:
 
     # A price without a unit count (e.g. JSON-LD price, generic product name)
     # is still recorded - as an unmatched product for manual mapping - but
-    # never crashes the run.
+    # never crashes the run. The scrape itself worked: status = success.
     if result.get("base_units") is None:
-        summary["error"] = "price found but unit count missing (unmatched)"
+        summary["status"] = "success"
+        summary["note"] = "price found but unit count missing (unmatched)"
         insert_success_log(store, mapping, result, matched=False, sku_id=None)
         store.update_mapping_status(mapping["id"], "success")
+        log(f"{source['name']}: recorded unmatched price (no unit count)")
         return summary
 
     # Match to a canonical SKU.
@@ -172,11 +209,16 @@ def scrape_mapping(store: Store, mapping: dict, skus: list[dict]) -> dict:
     )
     match = match_package(package, [dict_to_sku(s) for s in skus], mapping.get("sku_id"))
     if match.sku is None:
-        summary["error"] = "unmatched package (no SKU with equal effective units)"
+        # Scraping worked; matching failed. Recorded as an unmatched product
+        # (dashboard > Unmatched Products) and counted as a healthy scrape.
+        reason = "unmatched package (no SKU with equal effective units)"
         if match.ambiguous:
-            summary["error"] = "ambiguous package (multiple SKUs match)"
+            reason = "ambiguous package (multiple SKUs match)"
+        summary["status"] = "success"
+        summary["note"] = reason
         insert_success_log(store, mapping, result, matched=False, sku_id=None)
         store.update_mapping_status(mapping["id"], "success")
+        log(f"{source['name']}: {reason} - saved to Unmatched Products")
         return summary
 
     # Compute effective price and insert the matched log.
@@ -187,6 +229,7 @@ def scrape_mapping(store: Store, mapping: dict, skus: list[dict]) -> dict:
     summary["matched"] = True
     summary["sku"] = match.sku
     summary["eup"] = eup
+    log(f"{source['name']}: matched {match.sku.display_name} at {eup}/unit")
     return summary
 
 
@@ -200,6 +243,7 @@ def dict_to_sku(row: dict) -> object:
         base_units=row["base_units"],
         bonus_units=row.get("bonus_units", 0),
         game_id=row["game_id"],
+        dana_current_price=row.get("dana_current_price"),
     )
 
 
@@ -269,10 +313,17 @@ def evaluate_alerts(store: Store, summaries: list[dict]) -> int:
         sku = summary["sku"]
         game_id = sku.game_id
 
+        # DANA baseline: prefer the latest scraped DANA price log; fall back
+        # to the SKU's stored price (manual entry or last successful scrape).
         dana_log = store.get_latest_dana_log(sku.id)
-        if dana_log is None or dana_log.get("effective_unit_price") is None:
+        if dana_log is not None and dana_log.get("effective_unit_price") is not None:
+            dana_eup = Decimal(str(dana_log["effective_unit_price"]))
+        elif sku.dana_current_price:
+            dana_eup = effective_unit_price(
+                sku.dana_current_price, sku.base_units, sku.bonus_units
+            )
+        else:
             continue
-        dana_eup = Decimal(str(dana_log["effective_unit_price"]))
         comp_eup = summary.get("eup")
         if comp_eup is None:
             continue
@@ -317,21 +368,33 @@ def summary_source_id(summary: dict) -> int:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def run() -> int:
+def run(skip_dana: bool = False, dana_only: bool = False) -> int:
     load_dotenv()
     store = Store()
     run_row = store.start_run()
     run_id = run_row["id"] if run_row else None
     log(f"Scrape run {run_id} started")
 
-    totals = {"total": 0, "success": 0, "failed": 0, "alerts": 0}
+    # scraped = healthy scrape (matched or unmatched); matched/unmatched are
+    # tracked separately so a blocked DANA catalog never reads as "all failed".
+    totals = {"total": 0, "scraped": 0, "matched": 0, "unmatched": 0, "failed": 0, "alerts": 0}
     notes_parts: list[str] = []
+    sku_count = 0
 
     try:
-        sku_count = discover_dana_skus(store)
-        notes_parts.append(f"skus_upserted={sku_count}")
+        if not skip_dana:
+            sku_count = discover_dana_skus(store)
+            notes_parts.append(f"skus_upserted={sku_count}")
+            if sku_count == 0:
+                notes_parts.append("dana_discovery=blocked_or_empty")
+                log(
+                    "NOTE: DANA discovery found no SKUs (likely blocked from this network). "
+                    "Fix options: (1) run 'python -m scraper.runner --dana-only' from a "
+                    "network that can reach dana.id, or (2) add SKUs manually in the "
+                    "dashboard Admin tab."
+                )
 
-        mappings = store.get_enabled_mappings()
+        mappings = [] if dana_only else store.get_enabled_mappings()
         totals["total"] = len(mappings)
         log(f"Scraping {len(mappings)} enabled mappings")
 
@@ -343,7 +406,11 @@ def run() -> int:
             summary["product_url"] = mapping["product_url"]
             summaries.append(summary)
             if summary["status"] == "success":
-                totals["success"] += 1
+                totals["scraped"] += 1
+                if summary.get("matched"):
+                    totals["matched"] += 1
+                else:
+                    totals["unmatched"] += 1
             else:
                 totals["failed"] += 1
                 notes_parts.append(f"fail:{summary['source']}={summary.get('error', '')[:80]}")
@@ -351,7 +418,12 @@ def run() -> int:
 
         totals["alerts"] = evaluate_alerts(store, summaries)
 
-        status = "success" if totals["failed"] == 0 else ("partial" if totals["success"] > 0 else "failed")
+        if totals["scraped"] == 0 and totals["failed"] > 0:
+            status = "failed"
+        elif totals["failed"] > 0:
+            status = "partial"
+        else:
+            status = "success"
         if run_id is not None:
             store.finish_run(run_id, status, totals, "; ".join(notes_parts) or None)
         log(f"Run {run_id} finished: {status} {totals}")
@@ -365,5 +437,23 @@ def run() -> int:
         return 2
 
 
+def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="DANA price scraper")
+    parser.add_argument(
+        "--dana-only",
+        action="store_true",
+        help="Only discover DANA SKUs/prices. Run this from a network that can reach dana.id.",
+    )
+    parser.add_argument(
+        "--competitors-only",
+        action="store_true",
+        help="Skip DANA discovery (e.g. when CI is IP-blocked by dana.id).",
+    )
+    args = parser.parse_args()
+    return run(skip_dana=args.competitors_only, dana_only=args.dana_only)
+
+
 if __name__ == "__main__":
-    sys.exit(run())
+    sys.exit(main())

@@ -36,6 +36,7 @@ class SkuDefinition:
     base_units: int
     bonus_units: int = 0
     game_id: int | None = None
+    dana_current_price: float | None = None
 
     @property
     def effective_units(self) -> int:

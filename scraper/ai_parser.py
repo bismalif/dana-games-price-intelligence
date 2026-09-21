@@ -111,6 +111,7 @@ def parse_with_gemini(html: str, page_url: str, model_name: str | None = None) -
 
     try:
         from google import genai
+        from google.genai import types
     except ImportError:
         return None
 
@@ -124,7 +125,17 @@ def parse_with_gemini(html: str, page_url: str, model_name: str | None = None) -
 
     try:
         client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(model=model_name, contents=prompt)
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                # Extraction only - no tools, deterministic output. Also
+                # silences the SDK's automatic-function-calling deprecation
+                # warning for Models.generate_content.
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                temperature=0.0,
+            ),
+        )
         raw = response.text or ""
         # Tolerate markdown-fenced JSON.
         raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip(), flags=re.MULTILINE)

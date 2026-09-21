@@ -28,6 +28,9 @@ class Store:
     def get_games(self) -> list[dict]:
         return self.client.table("games").select("*").eq("active", True).execute().data or []
 
+    def get_sources(self) -> list[dict]:
+        return self.client.table("sources").select("*").execute().data or []
+
     def get_skus(self, game_id: int) -> list[dict]:
         return (
             self.client.table("game_skus")
@@ -137,7 +140,7 @@ class Store:
                 "finished_at": datetime.now(timezone.utc).isoformat(),
                 "status": status,
                 "sources_total": totals.get("total", 0),
-                "sources_success": totals.get("success", 0),
+                "sources_success": totals.get("scraped", 0),
                 "sources_failed": totals.get("failed", 0),
                 "alerts_sent": totals.get("alerts", 0),
                 "notes": notes,
