@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Secrets - never commit these
+.env
+.streamlit/secrets.toml
+
+# OS
+.DS_Store
+
+# Test / tooling artifacts
+.pytest_cache/
+playwright-report/
+test-results/
