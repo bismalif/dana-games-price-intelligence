@@ -13,6 +13,18 @@
 create extension if not exists pgcrypto;
 
 -- ---------------------------------------------------------------------------
+-- user_profiles: role per dashboard user; auto-created on signup.
+-- The FIRST user to sign up becomes 'admin' automatically.
+-- (Created before is_admin() because that function reads this table.)
+-- ---------------------------------------------------------------------------
+create table if not exists public.user_profiles (
+    id          uuid primary key references auth.users(id) on delete cascade,
+    email       text not null,
+    role        text not null default 'viewer' check (role in ('admin', 'viewer')),
+    created_at  timestamptz not null default now()
+);
+
+-- ---------------------------------------------------------------------------
 -- Admin helper (security definer to avoid RLS recursion on user_profiles)
 -- ---------------------------------------------------------------------------
 create or replace function public.is_admin()
@@ -29,17 +41,6 @@ as $$
           and role = 'admin'
     );
 $$;
-
--- ---------------------------------------------------------------------------
--- user_profiles: role per dashboard user; auto-created on signup.
--- The FIRST user to sign up becomes 'admin' automatically.
--- ---------------------------------------------------------------------------
-create table if not exists public.user_profiles (
-    id          uuid primary key references auth.users(id) on delete cascade,
-    email       text not null,
-    role        text not null default 'viewer' check (role in ('admin', 'viewer')),
-    created_at  timestamptz not null default now()
-);
 
 create or replace function public.handle_new_user()
 returns trigger
