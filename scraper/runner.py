@@ -62,6 +62,8 @@ def discover_dana_skus(store: Store) -> int:
             continue
 
         for package in packages:
+            if not package.get("base_units"):
+                continue  # cannot catalogue a package without unit counts
             sku_code = f"{game['slug']}-{package['base_units']}{'+' + str(package['bonus_units']) if package.get('bonus_units') else ''}"
             store.upsert_game_sku(
                 game["id"],
@@ -151,6 +153,15 @@ def scrape_mapping(store: Store, mapping: dict, skus: list[dict]) -> dict:
         insert_failure_log(store, mapping, summary["error"])
         return summary
 
+    # A price without a unit count (e.g. JSON-LD price, generic product name)
+    # is still recorded - as an unmatched product for manual mapping - but
+    # never crashes the run.
+    if result.get("base_units") is None:
+        summary["error"] = "price found but unit count missing (unmatched)"
+        insert_success_log(store, mapping, result, matched=False, sku_id=None)
+        store.update_mapping_status(mapping["id"], "success")
+        return summary
+
     # Match to a canonical SKU.
     package = CandidatePackage(
         product_name=result.get("product_name") or "",
@@ -214,6 +225,9 @@ def insert_success_log(
     sku_id: int | None,
     eup: Decimal | None = None,
 ) -> None:
+    base_units = result.get("base_units")
+    bonus_units = result.get("bonus_units", 0) or 0
+    effective = base_units + bonus_units if base_units is not None else None
     store.insert_price_log(
         {
             "mapping_id": mapping["id"],
@@ -223,9 +237,9 @@ def insert_success_log(
             "product_name": result.get("product_name"),
             "total_price": float(result["total_price"]),
             "currency": "IDR",
-            "base_units": result["base_units"],
-            "bonus_units": result.get("bonus_units", 0),
-            "effective_units": result["base_units"] + result.get("bonus_units", 0),
+            "base_units": base_units,
+            "bonus_units": bonus_units,
+            "effective_units": effective,
             "effective_unit_price": float(eup) if eup is not None else None,
             "matched": matched,
             "scrape_status": "success",
