@@ -193,9 +193,11 @@ def build_comparison(data: dict, game_id: int) -> pd.DataFrame:
     for sku in [s for s in data["skus"] if s["game_id"] == game_id]:
         units = sku["effective_units"]
         dana_log = dana_latest.get(sku["id"])
-        dana_price = dana_log.get("total_price") if dana_log else None
+        # Prefer the latest scraped DANA price log; fall back to the SKU's
+        # stored price (manual entry via Admin tab, or last discovery run).
+        dana_price = dana_log.get("total_price") if dana_log else sku.get("dana_current_price")
         dana_eup = effective_unit_price(dana_price, sku["base_units"], sku["bonus_units"])
-        dana_age = age_label(dana_log.get("captured_at")) if dana_log else "no data"
+        dana_age = age_label(dana_log.get("captured_at")) if dana_log else "stored price"
 
         if not any(key[0] == sku["id"] for key in competitor_latest):
             rows.append(
