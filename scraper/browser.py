@@ -56,3 +56,70 @@ def open_page(url: str, wait_seconds: float = 3.0, timeout_ms: int = DEFAULT_TIM
             yield page.content()
         finally:
             browser.close()
+
+
+def open_catalog_pages(
+    url: str,
+    wait_seconds: float = 3.0,
+    timeout_ms: int = DEFAULT_TIMEOUT_MS,
+    max_tabs: int = 12,
+) -> list[str]:
+    """Load a catalog page, click through its category pills/tabs, and
+    return one HTML snapshot per visible state (first = default view).
+
+    Many top-up catalogs (DANA, Codashop, UniPin...) hide package groups
+    like 'Weekly Diamond Pass' behind tabs. We click each pill once and
+    capture the DOM after it settles, so extraction sees every group.
+    """
+    snapshots: list[str] = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True, args=LAUNCH_ARGS)
+        try:
+            context = browser.new_context(user_agent=USER_AGENT, locale="id-ID")
+            page = context.new_page()
+            last_error: Exception | None = None
+            for attempt in range(1, GOTO_ATTEMPTS + 1):
+                try:
+                    for wait_until in ("networkidle", "load", "domcontentloaded"):
+                        try:
+                            page.goto(url, timeout=timeout_ms, wait_until=wait_until)
+                            last_error = None
+                            break
+                        except Exception as exc:
+                            last_error = exc
+                    if last_error is None:
+                        break
+                except Exception as exc:
+                    last_error = exc
+                if attempt < GOTO_ATTEMPTS:
+                    time.sleep(2.0 * attempt)
+            if last_error is not None:
+                raise last_error
+            page.wait_for_timeout(int(wait_seconds * 1000))
+            snapshots.append(page.content())
+
+            # Click candidate tab/pill elements; capture DOM after each.
+            clicked: set[str] = set()
+            handles = page.query_selector_all(
+                "[role=tab], button, [class*=tab i], [class*=pill i], [class*=chip i], [class*=category i]"
+            )
+            for handle in handles[:200]:
+                if len(snapshots) > max_tabs:
+                    break
+                try:
+                    label = (handle.inner_text() or "").strip()
+                    if not label or len(label) > 40 or label.lower() in clicked:
+                        continue
+                    # Only click things that look like category tabs, not
+                    # 'buy' buttons or links that navigate away.
+                    if not handle.is_visible():
+                        continue
+                    clicked.add(label.lower())
+                    handle.click(timeout=2000)
+                    page.wait_for_timeout(1200)
+                    snapshots.append(page.content())
+                except Exception:
+                    continue  # unclickable element - skip
+        finally:
+            browser.close()
+    return snapshots

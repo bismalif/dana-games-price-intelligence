@@ -3,12 +3,16 @@
 import unittest
 
 from scraper.extractors import (
+    clean_product_name,
     extract,
     extract_from_json_ld,
     extract_from_meta,
     extract_from_selectors,
     extract_from_text,
+    extract_packages,
+    final_idr_price,
     parse_idr_price,
+    parse_idr_prices,
     parse_units,
 )
 
@@ -154,6 +158,80 @@ class TestOrchestrator(unittest.TestCase):
     def test_nothing_found(self):
         result = extract("<html><body><p>hello</p></body></html>")
         self.assertIsNone(result)
+
+
+class TestFinalPrice(unittest.TestCase):
+    def test_all_prices_in_order(self):
+        self.assertEqual(
+            parse_idr_prices("5 Diamonds Rp1.150 Rp1.000"), [1150, 1000]
+        )
+
+    def test_final_price_is_last(self):
+        self.assertEqual(final_idr_price("5 Diamonds Rp1.150 Rp1.000"), 1000)
+
+    def test_single_price(self):
+        self.assertEqual(final_idr_price("Rp 199.000"), 199000)
+
+    def test_clean_product_name(self):
+        self.assertEqual(clean_product_name("5 Diamonds Rp1.150 Rp1.000"), "5 Diamonds")
+        self.assertEqual(clean_product_name("86 Diamonds + 8 Bonus"), "86 Diamonds + 8 Bonus")
+
+
+class TestExtractPackages(unittest.TestCase):
+    def test_multiple_cards_with_discounted_price(self):
+        html = """
+        <html><body>
+        <div class="card"><span>5 Diamonds Rp1.150 Rp1.000</span></div>
+        <div class="card"><span>70 Diamonds Rp11.500 Rp10.500</span></div>
+        <div class="card"><span>140 Diamonds Rp23.000 Rp21.000</span></div>
+        </body></html>
+        """
+        packages = extract_packages(html)
+        self.assertEqual(len(packages), 3)
+        by_units = {p["base_units"]: p for p in packages}
+        self.assertEqual(by_units[5]["total_price"], 1000)  # final, not 1150
+        self.assertEqual(by_units[5]["product_name"], "5 Diamonds")
+        self.assertEqual(by_units[70]["total_price"], 10500)
+        self.assertEqual(by_units[140]["total_price"], 21000)
+
+    def test_pass_product_without_units(self):
+        html = """
+        <html><body>
+        <div class="card"><span>Weekly Diamond Pass Rp16.000 Rp15.000</span></div>
+        </body></html>
+        """
+        packages = extract_packages(html)
+        self.assertEqual(len(packages), 1)
+        self.assertEqual(packages[0]["base_units"], 0)
+        self.assertEqual(packages[0]["product_name"], "Weekly Diamond Pass")
+        self.assertEqual(packages[0]["total_price"], 15000)
+
+    def test_dedupes_same_units(self):
+        html = """
+        <html><body>
+        <div><span>70 Diamonds Rp11.500</span></div>
+        <div><span>70 Diamonds Rp11.500</span></div>
+        </body></html>
+        """
+        self.assertEqual(len(extract_packages(html)), 1)
+
+    def test_ignores_grid_scope(self):
+        # A giant container with many cards must not become one bogus package
+        # pairing the first units with the last price.
+        html = """
+        <html><body>
+        <div class="grid">
+        <div><span>70 Diamonds</span><span>Rp 11.500</span></div>
+        <div><span>140 Diamonds</span><span>Rp 23.000</span></div>
+        <div><span>355 Diamonds</span><span>Rp 57.500</span></div>
+        </div>
+        </body></html>
+        """
+        packages = extract_packages(html)
+        self.assertEqual(len(packages), 3)
+        by_units = {p["base_units"]: p for p in packages}
+        self.assertEqual(by_units[70]["total_price"], 11500)
+        self.assertEqual(by_units[355]["total_price"], 57500)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,7 @@ The Supabase SECRET key must NEVER be placed here - it is only for the scraper.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 
 import pandas as pd
 import streamlit as st
@@ -192,18 +193,23 @@ def build_comparison(data: dict, game_id: int) -> pd.DataFrame:
     rows = []
     for sku in [s for s in data["skus"] if s["game_id"] == game_id]:
         units = sku["effective_units"]
+        units_label = f"{sku['base_units']} + {sku['bonus_units']} = {units}" if units > 0 else "Pass"
         dana_log = dana_latest.get(sku["id"])
         # Prefer the latest scraped DANA price log; fall back to the SKU's
         # stored price (manual entry via Admin tab, or last discovery run).
         dana_price = dana_log.get("total_price") if dana_log else sku.get("dana_current_price")
-        dana_eup = effective_unit_price(dana_price, sku["base_units"], sku["bonus_units"])
+        if units > 0:
+            dana_eup = effective_unit_price(dana_price, sku["base_units"], sku["bonus_units"])
+        else:
+            # Pass products: compare by final total price.
+            dana_eup = Decimal(str(dana_price)) if dana_price is not None else None
         dana_age = age_label(dana_log.get("captured_at")) if dana_log else "stored price"
 
         if not any(key[0] == sku["id"] for key in competitor_latest):
             rows.append(
                 {
                     "SKU": sku["display_name"],
-                    "Units": f"{sku['base_units']} + {sku['bonus_units']} = {units}",
+                    "Units": units_label,
                     "DANA Price": fmt_rp(dana_price),
                     "DANA Eff./Unit": fmt_eup(dana_eup),
                     "DANA Freshness": dana_age,
@@ -220,11 +226,14 @@ def build_comparison(data: dict, game_id: int) -> pd.DataFrame:
         for (sku_id, source_id), log in sorted(competitor_latest.items()):
             if sku_id != sku["id"]:
                 continue
-            comp_units = log.get("effective_units") or units
-            comp_base = (log.get("base_units") or 0) or None
-            comp_bonus = log.get("bonus_units") or 0
             comp_price = log.get("total_price")
-            comp_eup = effective_unit_price(comp_price, comp_base, comp_bonus) if comp_base else None
+            comp_base = log.get("base_units")
+            if units > 0 and comp_base:
+                comp_eup = effective_unit_price(comp_price, comp_base, log.get("bonus_units") or 0)
+            elif units == 0:
+                comp_eup = Decimal(str(comp_price)) if comp_price is not None else None
+            else:
+                comp_eup = None
             diff = (
                 undercut_pct(dana_eup, comp_eup) if dana_eup and comp_eup else None
             )
@@ -240,7 +249,7 @@ def build_comparison(data: dict, game_id: int) -> pd.DataFrame:
             rows.append(
                 {
                     "SKU": sku["display_name"],
-                    "Units": f"{sku['base_units']} + {sku['bonus_units']} = {units}",
+                    "Units": units_label,
                     "DANA Price": fmt_rp(dana_price),
                     "DANA Eff./Unit": fmt_eup(dana_eup),
                     "DANA Freshness": dana_age,

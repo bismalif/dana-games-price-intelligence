@@ -8,6 +8,7 @@ Runs in CI:   .github/workflows/scrape.yml (daily 10:00 Asia/Jakarta)
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -17,8 +18,8 @@ from dotenv import load_dotenv
 
 from .ai_parser import parse_with_gemini
 from .alerts import send_ops_alert, send_undercut_alert
-from .browser import open_page
-from .extractors import extract
+from .browser import open_catalog_pages, open_page
+from .extractors import extract, extract_packages
 from .matcher import CandidatePackage, match_package
 from .pricing import effective_unit_price, is_undercutting, undercut_pct
 from .store import Store
@@ -37,10 +38,14 @@ def log(message: str) -> None:
 # ---------------------------------------------------------------------------
 
 def discover_dana_skus(store: Store) -> int:
-    """Scrape DANA catalog pages: upsert SKUs AND write DANA price logs.
+    """Scrape DANA catalog pages (including hidden pill/tab groups) and
+    upsert SKUs + DANA price logs.
 
     DANA price logs are what the comparison/alert logic reads, so they must
-    exist even when the SKU catalog is already populated.
+    exist even when the SKU catalog is already populated. Cards showing an
+    original + discounted price are stored at the FINAL price. Pass products
+    (e.g. 'Weekly Diamond Pass') are captured with base_units=0 and matched
+    by name.
 
     Returns the number of SKUs upserted.
     """
@@ -60,29 +65,44 @@ def discover_dana_skus(store: Store) -> int:
             continue
         log(f"Discovering DANA SKUs for {game['name']}: {dana_url}")
         try:
-            with open_page(dana_url) as html:
-                result = extract(html)
-                # The single-package extractor returns one card; catalog pages
-                # list many - parse the full card grid from the same HTML.
-                packages = extract_dana_packages(html) or ([result] if result else [])
+            snapshots = open_catalog_pages(dana_url)
         except Exception as exc:
             log(f"ERROR: DANA discovery failed for {game['name']}: {exc}")
             continue
+
+        # Aggregate packages across the default view and every clicked tab.
+        packages: list[dict] = []
+        seen: set[tuple] = set()
+        for html in snapshots:
+            for package in extract_packages(html):
+                base = package.get("base_units") or 0
+                if base > 0:
+                    key = ("units", base, package.get("bonus_units", 0))
+                else:
+                    key = ("pass", (package.get("product_name") or "").lower())
+                if key not in seen:
+                    seen.add(key)
+                    packages.append(package)
         if not packages:
             log(f"WARN: no packages parsed from DANA page for {game['name']}")
             continue
 
         for package in packages:
-            if not package.get("base_units"):
-                continue  # cannot catalogue a package without unit counts
-            sku_code = f"{game['slug']}-{package['base_units']}{'+' + str(package['bonus_units']) if package.get('bonus_units') else ''}"
+            base_units = package.get("base_units") or 0
+            bonus_units = package.get("bonus_units", 0) or 0
+            name = package.get("product_name") or f"{game['slug']} package"
+            if base_units > 0:
+                sku_code = f"{game['slug']}-{base_units}" + (f"+{bonus_units}" if bonus_units else "")
+            else:
+                slug_name = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")[:50]
+                sku_code = f"{game['slug']}-{slug_name or 'pass'}"
             sku = store.upsert_game_sku(
                 game["id"],
                 {
                     "sku_code": sku_code,
-                    "display_name": package.get("product_name") or sku_code,
-                    "base_units": package["base_units"],
-                    "bonus_units": package.get("bonus_units", 0),
+                    "display_name": name,
+                    "base_units": base_units,
+                    "bonus_units": bonus_units,
                     "dana_current_price": float(package["total_price"]),
                 },
             )
@@ -91,20 +111,22 @@ def discover_dana_skus(store: Store) -> int:
 
             # Record the DANA price log for this SKU (comparison baseline).
             if sku is not None:
-                eup = effective_unit_price(
-                    package["total_price"], package["base_units"], package.get("bonus_units", 0)
+                eup = (
+                    effective_unit_price(package["total_price"], base_units, bonus_units)
+                    if base_units > 0
+                    else None
                 )
                 store.insert_price_log(
                     {
                         "sku_id": sku["id"],
                         "game_id": game["id"],
                         "source_id": dana_source["id"],
-                        "product_name": package.get("product_name") or sku_code,
+                        "product_name": name,
                         "total_price": float(package["total_price"]),
                         "currency": "IDR",
-                        "base_units": package["base_units"],
-                        "bonus_units": package.get("bonus_units", 0),
-                        "effective_units": package["base_units"] + package.get("bonus_units", 0),
+                        "base_units": base_units,
+                        "bonus_units": bonus_units,
+                        "effective_units": base_units + bonus_units,
                         "effective_unit_price": float(eup) if eup is not None else None,
                         "matched": True,
                         "scrape_status": "success",
@@ -116,51 +138,21 @@ def discover_dana_skus(store: Store) -> int:
     return count
 
 
-def extract_dana_packages(html: str) -> list[dict]:
-    """Parse every package card from a DANA catalog page."""
-    from bs4 import BeautifulSoup
-
-    from .extractors import parse_idr_price, parse_units
-
-    soup = BeautifulSoup(html, "html.parser")
-    packages: list[dict] = []
-    seen: set[tuple[int, int]] = set()
-    for el in soup.find_all(string=lambda t: t and "rp" in t.lower()):
-        scope = el.parent
-        for _ in range(3):
-            text = scope.get_text(" ", strip=True) if scope else ""
-            units = parse_units(text)
-            price = parse_idr_price(text)
-            if units and price and (units[0], units[1]) not in seen:
-                seen.add((units[0], units[1]))
-                packages.append(
-                    {
-                        "product_name": text[:200],
-                        "total_price": price,
-                        "base_units": units[0],
-                        "bonus_units": units[1],
-                    }
-                )
-                break
-            if scope is None or scope.parent is None:
-                break
-            scope = scope.parent
-    return packages
-
-
 # ---------------------------------------------------------------------------
 # Competitor scraping
 # ---------------------------------------------------------------------------
 
 def scrape_mapping(store: Store, mapping: dict, skus: list[dict]) -> dict:
-    """Scrape one competitor mapping. Returns a summary dict for the run log."""
+    """Scrape one competitor mapping. Catalog pages yield MANY packages -
+    each is matched and logged individually. Returns a run summary."""
     source = mapping["sources"]
     summary = {
         "source": source["name"],
         "game_id": mapping["game_id"],
         "status": "failed",
-        "matched": False,
-        "alerted": False,
+        "matches": [],  # [{sku, eup, total_price}] for alert evaluation
+        "package_count": 0,
+        "matched_count": 0,
     }
 
     if mapping.get("requires_auth"):
@@ -172,64 +164,89 @@ def scrape_mapping(store: Store, mapping: dict, skus: list[dict]) -> dict:
     log(f"Scraping {source['name']} ({mapping.get('product_label') or ''}): {url}")
     try:
         with open_page(url) as html:
-            result = extract(html, mapping.get("price_selector"), mapping.get("units_selector"))
-            if result is None:
+            # 1. Multi-package card extraction (catalog pages).
+            packages = extract_packages(html)
+            # 2. Single-package chain (JSON-LD / meta / selectors / text).
+            if not packages:
+                single = extract(html, mapping.get("price_selector"), mapping.get("units_selector"))
+                if single and single.get("base_units") is not None:
+                    packages = [single]
+            # 3. Gemini fallback - last resort.
+            if not packages:
                 log(f"Deterministic extraction failed; trying Gemini fallback for {url}")
-                result = parse_with_gemini(html, url)
+                gemini = parse_with_gemini(html, url)
+                if gemini and gemini.get("base_units") is not None:
+                    packages = [gemini]
     except Exception as exc:
         summary["error"] = f"browser error: {exc}"
         store.update_mapping_status(mapping["id"], "failed", str(exc)[:500])
         insert_failure_log(store, mapping, summary["error"])
         return summary
 
-    if result is None:
+    if not packages:
         summary["error"] = "extraction failed (deterministic + Gemini)"
         store.update_mapping_status(mapping["id"], "failed", summary["error"])
         insert_failure_log(store, mapping, summary["error"])
         return summary
 
-    # A price without a unit count (e.g. JSON-LD price, generic product name)
-    # is still recorded - as an unmatched product for manual mapping - but
-    # never crashes the run. The scrape itself worked: status = success.
-    if result.get("base_units") is None:
-        summary["status"] = "success"
-        summary["note"] = "price found but unit count missing (unmatched)"
-        insert_success_log(store, mapping, result, matched=False, sku_id=None)
-        store.update_mapping_status(mapping["id"], "success")
-        log(f"{source['name']}: recorded unmatched price (no unit count)")
-        return summary
-
-    # Match to a canonical SKU.
-    package = CandidatePackage(
-        product_name=result.get("product_name") or "",
-        base_units=result["base_units"],
-        bonus_units=result.get("bonus_units", 0),
-        total_price=float(result["total_price"]),
-        product_url=url,
-    )
-    match = match_package(package, [dict_to_sku(s) for s in skus], mapping.get("sku_id"))
-    if match.sku is None:
-        # Scraping worked; matching failed. Recorded as an unmatched product
-        # (dashboard > Unmatched Products) and counted as a healthy scrape.
-        reason = "unmatched package (no SKU with equal effective units)"
-        if match.ambiguous:
-            reason = "ambiguous package (multiple SKUs match)"
-        summary["status"] = "success"
-        summary["note"] = reason
-        insert_success_log(store, mapping, result, matched=False, sku_id=None)
-        store.update_mapping_status(mapping["id"], "success")
-        log(f"{source['name']}: {reason} - saved to Unmatched Products")
-        return summary
-
-    # Compute effective price and insert the matched log.
-    eup = effective_unit_price(result["total_price"], result["base_units"], result.get("bonus_units", 0))
-    insert_success_log(store, mapping, result, matched=True, sku_id=match.sku["id"], eup=eup)
-    store.update_mapping_status(mapping["id"], "success")
+    # Scrape worked: record every package (matched or not) and count the
+    # mapping as healthy.
     summary["status"] = "success"
-    summary["matched"] = True
-    summary["sku"] = match.sku
-    summary["eup"] = eup
-    log(f"{source['name']}: matched {match.sku.display_name} at {eup}/unit")
+    summary["package_count"] = len(packages)
+    sku_objects = [dict_to_sku(s) for s in skus]
+
+    for package in packages:
+        if package.get("base_units") is None:
+            # Price without unit info: record unmatched, keep going.
+            insert_success_log(store, mapping, package, matched=False, sku_id=None)
+            continue
+        # Manual SKU overrides apply to single-product pages only - a
+        # catalog page's packages each map to their own SKU.
+        manual = mapping.get("sku_id") if len(packages) == 1 else None
+        match = match_package(
+            CandidatePackage(
+                product_name=package.get("product_name") or "",
+                base_units=package["base_units"],
+                bonus_units=package.get("bonus_units", 0),
+                total_price=float(package["total_price"]),
+                product_url=url,
+            ),
+            sku_objects,
+            manual,
+        )
+        if match.sku is None:
+            reason = "unmatched package (no SKU with equal effective units)"
+            if match.ambiguous:
+                reason = "ambiguous package (multiple SKUs match)"
+            summary["note"] = reason
+            insert_success_log(store, mapping, package, matched=False, sku_id=None)
+            continue
+
+        eup = (
+            effective_unit_price(package["total_price"], package["base_units"], package.get("bonus_units", 0))
+            if package["base_units"] > 0
+            else None
+        )
+        insert_success_log(store, mapping, package, matched=True, sku_id=match.sku["id"], eup=eup)
+        summary["matched_count"] += 1
+        summary["matches"].append(
+            {
+                "sku": match.sku,
+                "eup": eup,
+                "total_price": float(package["total_price"]),
+            }
+        )
+        if eup is not None:
+            log(f"{source['name']}: matched {match.sku.display_name} at {eup}/unit")
+        else:
+            log(f"{source['name']}: matched pass {match.sku.display_name} at IDR {package['total_price']}")
+
+    store.update_mapping_status(mapping["id"], "success")
+    if summary["matched_count"] == 0:
+        log(
+            f"{source['name']}: {len(packages)} package(s) scraped, none matched "
+            "- saved to Unmatched Products"
+        )
     return summary
 
 
@@ -308,54 +325,62 @@ def evaluate_alerts(store: Store, summaries: list[dict]) -> int:
     alerts_sent = 0
 
     for summary in summaries:
-        if not summary.get("matched") or summary.get("sku") is None:
-            continue
-        sku = summary["sku"]
-        game_id = sku.game_id
+        for match in summary.get("matches", []):
+            sku = match["sku"]
 
-        # DANA baseline: prefer the latest scraped DANA price log; fall back
-        # to the SKU's stored price (manual entry or last successful scrape).
-        dana_log = store.get_latest_dana_log(sku.id)
-        if dana_log is not None and dana_log.get("effective_unit_price") is not None:
-            dana_eup = Decimal(str(dana_log["effective_unit_price"]))
-        elif sku.dana_current_price:
-            dana_eup = effective_unit_price(
-                sku.dana_current_price, sku.base_units, sku.bonus_units
-            )
-        else:
-            continue
-        comp_eup = summary.get("eup")
-        if comp_eup is None:
-            continue
+            # DANA baseline: prefer the latest scraped DANA price log; fall
+            # back to the SKU's stored price (manual entry or last scrape).
+            dana_log = store.get_latest_dana_log(sku.id)
+            if dana_log is not None and dana_log.get("effective_unit_price") is not None:
+                dana_eup = Decimal(str(dana_log["effective_unit_price"]))
+            elif sku.dana_current_price and sku.base_units > 0:
+                dana_eup = effective_unit_price(
+                    sku.dana_current_price, sku.base_units, sku.bonus_units
+                )
+            else:
+                continue
 
-        undercutting = is_undercutting(dana_eup, comp_eup)
-        pct = undercut_pct(dana_eup, comp_eup)
-        previous = store.get_alert_state(sku.id, summary_source_id(summary))
+            comp_eup = match.get("eup")
+            if comp_eup is None:
+                # Pass products have no per-unit price; alert on total price.
+                dana_total = (
+                    Decimal(str(dana_log["total_price"]))
+                    if dana_log is not None and dana_log.get("total_price") is not None
+                    else (Decimal(str(sku.dana_current_price)) if sku.dana_current_price else None)
+                )
+                comp_total = Decimal(str(match.get("total_price")))
+                if dana_total is None or dana_total <= 0:
+                    continue
+                dana_eup, comp_eup = dana_total, comp_total
 
-        was_undercutting = bool(previous and previous.get("is_undercutting"))
-        store.set_alert_state(sku.id, summary_source_id(summary), undercutting, pct)
+            undercutting = is_undercutting(dana_eup, comp_eup)
+            pct = undercut_pct(dana_eup, comp_eup)
+            previous = store.get_alert_state(sku.id, summary_source_id(summary))
 
-        should_alert = undercutting and not was_undercutting
-        if undercutting and previous is None and not ALLOW_BASELINE_ALERTS:
-            should_alert = False  # baseline run: record state only
-        if should_alert:
-            game_name = next(
-                (g["name"] for g in store.get_games() if g["id"] == game_id),
-                f"game {game_id}",
-            )
-            response = send_undercut_alert(
-                game_name=game_name,
-                sku_name=sku.display_name,
-                source_name=summary["source"],
-                dana_effective=dana_eup,
-                competitor_effective=comp_eup,
-                pct_cheaper=pct,
-                product_url=summary.get("product_url"),
-            )
-            if response is not None:
-                store.mark_alerted(sku.id, summary_source_id(summary))
-                alerts_sent += 1
-                log(f"ALERT sent: {sku.display_name} undercut by {summary['source']} ({pct}%)")
+            was_undercutting = bool(previous and previous.get("is_undercutting"))
+            store.set_alert_state(sku.id, summary_source_id(summary), undercutting, pct)
+
+            should_alert = undercutting and not was_undercutting
+            if undercutting and previous is None and not ALLOW_BASELINE_ALERTS:
+                should_alert = False  # baseline run: record state only
+            if should_alert:
+                game_name = next(
+                    (g["name"] for g in store.get_games() if g["id"] == sku.game_id),
+                    f"game {sku.game_id}",
+                )
+                response = send_undercut_alert(
+                    game_name=game_name,
+                    sku_name=sku.display_name,
+                    source_name=summary["source"],
+                    dana_effective=dana_eup,
+                    competitor_effective=comp_eup,
+                    pct_cheaper=pct,
+                    product_url=summary.get("product_url"),
+                )
+                if response is not None:
+                    store.mark_alerted(sku.id, summary_source_id(summary))
+                    alerts_sent += 1
+                    log(f"ALERT sent: {sku.display_name} undercut by {summary['source']} ({pct}%)")
     return alerts_sent
 
 
@@ -407,9 +432,8 @@ def run(skip_dana: bool = False, dana_only: bool = False) -> int:
             summaries.append(summary)
             if summary["status"] == "success":
                 totals["scraped"] += 1
-                if summary.get("matched"):
-                    totals["matched"] += 1
-                else:
+                totals["matched"] += summary.get("matched_count", 0)
+                if summary.get("matched_count", 0) == 0:
                     totals["unmatched"] += 1
             else:
                 totals["failed"] += 1

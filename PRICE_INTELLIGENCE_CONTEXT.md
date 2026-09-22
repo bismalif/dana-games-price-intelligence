@@ -110,7 +110,39 @@ Competitor packages are matched to DANA SKUs automatically:
 3. Multiple SKUs with the same effective units -> ambiguous, left unmatched
    for manual mapping (visible in the dashboard's Unmatched Products tab).
 
-## 6. Extraction pipeline (scraper/extractors.py, ai_parser.py)
+## 6. Extraction pipeline (scraper/extractors.py, browser.py, ai_parser.py)
+
+### Final price rule
+
+Catalog cards often show both an original and a discounted amount
+(`5 Diamonds Rp1.150 Rp1.000`). The **LAST price in the card text is treated
+as the final price** and is what gets stored and compared. Product names are
+cleaned of price text (`5 Diamonds`).
+
+### Multi-package extraction
+
+`extract_packages(html)` parses every package card on a catalog page (short
+text scope containing unit keywords or a pass label plus IDR amounts, capped
+at 400 chars so a whole grid is never mistaken for one card). Deduplication
+is by unit composition / pass name.
+
+### Pass products (no fixed unit count)
+
+Items like `Weekly Diamond Pass` have no diamond count. They are captured
+with `base_units = 0` and **matched by normalized product name** against DANA
+SKUs discovered the same way. Because they have no per-unit price, they are
+compared by final total price on the dashboard and in alerts.
+
+### Hidden catalog tabs
+
+Some catalogs hide package groups behind category pills (e.g. DANA's
+`Weekly Diamond Pass` tab). `browser.open_catalog_pages(url)` loads the page,
+clicks each visible pill/label (button / role=tab / class contains tab, pill,
+chip, category - short labels only, navigation-looking labels skipped), and
+returns one HTML snapshot per distinct state. DANA discovery aggregates
+packages across all snapshots.
+
+### Single-package chain (product pages)
 
 Deterministic chain, cheapest/most-reliable first:
 
@@ -127,6 +159,11 @@ If all fail -> **Gemini fallback**:
 - Validation: IDR only, sane price/units bounds, confidence clamped 0-1.
 - Stored with `parser_method='gemini_fallback'` so AI-parsed rows are
   identifiable on the dashboard.
+
+Competitor scraping order per mapping: `extract_packages` (multi) ->
+single-package chain -> Gemini. Each package is matched and logged
+individually; a mapping with zero matches still counts as a healthy scrape
+(rows land in Unmatched Products).
 
 ## 7. Alerting (scraper/alerts.py)
 

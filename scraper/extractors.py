@@ -28,14 +28,45 @@ BONUS_RE = re.compile(r"\+\s*(\d[\d.,]*)\s*(?:bonus|extra|free)?", re.IGNORECASE
 
 
 def parse_idr_price(text: str) -> Decimal | None:
-    """Extract an IDR amount from text like 'Rp 199.000' or 'Rp199,000'."""
+    """Extract the FIRST IDR amount from text like 'Rp 199.000'."""
+    prices = parse_idr_prices(text)
+    return prices[0] if prices else None
+
+
+def parse_idr_prices(text: str) -> list[Decimal]:
+    """Extract ALL IDR amounts in text, in order of appearance.
+
+    Catalog cards often show both an original and a discounted price
+    ('5 Diamonds Rp1.150 Rp1.000') - the LAST one is the final price.
+    """
     if not text:
-        return None
-    match = IDR_PRICE_RE.search(text)
-    if not match:
-        return None
-    raw = match.group(1) or match.group(2)
-    return _to_decimal(raw)
+        return []
+    values: list[Decimal] = []
+    for match in IDR_PRICE_RE.finditer(text):
+        raw = match.group(1) or match.group(2)
+        value = _to_decimal(raw)
+        if value is not None:
+            values.append(value)
+    return values
+
+
+def final_idr_price(text: str) -> Decimal | None:
+    """The FINAL (discounted) price: the last IDR amount in the text."""
+    prices = parse_idr_prices(text)
+    return prices[-1] if prices else None
+
+
+def clean_product_name(text: str) -> str:
+    """Strip price amounts and currency tokens from a product label.
+
+    '5 Diamonds Rp1.150 Rp1.000' -> '5 Diamonds'
+    """
+    if not text:
+        return ""
+    cleaned = IDR_PRICE_RE.sub(" ", text)
+    cleaned = re.sub(r"\b(?:rp|idr|rupiah)\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -–—|·,.")
+    return cleaned[:200]
 
 
 def _to_decimal(raw: str) -> Decimal | None:
@@ -239,12 +270,69 @@ def extract_from_selectors(soup: BeautifulSoup, price_selector: str | None, unit
 
 PRICE_TEXT_RE = re.compile(r"rp\.?\s*[0-9]", re.IGNORECASE)
 
+# Pass products have no fixed unit count ('Weekly Diamond Pass'); they are
+# captured with base_units=0 and matched to SKUs by normalized name.
+PASS_RE = re.compile(r"\b(weekly|monthly)\b[\w\s]{0,30}\bpass\b", re.IGNORECASE)
+
+# A card scope larger than this is a grid, not a single package - pairing
+# units with prices across it would be meaningless.
+MAX_CARD_CHARS = 400
+
+
+def extract_packages(html: str) -> list[dict]:
+    """Extract EVERY package card from a catalog page.
+
+    Card layout: a short text scope containing unit keywords (or a pass
+    label) plus one or more IDR amounts. Uses the FINAL (last) price when a
+    card shows original + discounted amounts. Deduplicates by unit
+    composition (or pass name).
+    """
+    soup = BeautifulSoup(html or "", "html.parser")
+    packages: list[dict] = []
+    seen: set[tuple] = set()
+    for el in soup.find_all(string=PRICE_TEXT_RE):
+        container = el.parent
+        if container is None:
+            continue
+        scope = container
+        for _ in range(3):
+            scope_text = scope.get_text(" ", strip=True)
+            prices = parse_idr_prices(scope_text)
+            units = parse_units(scope_text) if prices else None
+            is_pass = prices and units is None and bool(PASS_RE.search(scope_text))
+            if (units or is_pass) and len(scope_text) <= MAX_CARD_CHARS:
+                if units:
+                    base, bonus = units
+                    key = ("units", base, bonus)
+                else:
+                    base, bonus = 0, 0
+                    key = ("pass", clean_product_name(scope_text).lower())
+                if key not in seen:
+                    seen.add(key)
+                    packages.append(
+                        {
+                            "product_name": clean_product_name(scope_text)
+                            or f"package {base}+{bonus}",
+                            "total_price": prices[-1],  # final price wins
+                            "currency": "IDR",
+                            "base_units": base,
+                            "bonus_units": bonus,
+                            "method": "text_heuristics",
+                            "confidence": 0.6,
+                        }
+                    )
+                break
+            if scope.parent is None:
+                break
+            scope = scope.parent
+    return packages
+
 
 def extract_from_text(soup: BeautifulSoup) -> dict | None:
     """Scan visible elements for paired unit labels and IDR prices.
 
-    Returns the first coherent (units, price) pair, or a list-style result
-    when the page shows a package grid.
+    Returns the cheapest coherent (units, final price) pair - list pages
+    often show 'starting from' prices.
     """
     results = []
     for el in soup.find_all(string=PRICE_TEXT_RE):
@@ -256,13 +344,13 @@ def extract_from_text(soup: BeautifulSoup) -> dict | None:
         scope = container
         for _ in range(3):
             scope_text = scope.get_text(" ", strip=True)
+            prices = parse_idr_prices(scope_text)
             units = parse_units(scope_text)
-            price = parse_idr_price(scope_text)
-            if units and price:
+            if units and prices and len(scope_text) <= MAX_CARD_CHARS:
                 results.append(
                     {
-                        "product_name": scope_text[:200],
-                        "total_price": price,
+                        "product_name": clean_product_name(scope_text),
+                        "total_price": prices[-1],  # final price wins
                         "currency": "IDR",
                         "base_units": units[0],
                         "bonus_units": units[1],
@@ -276,8 +364,6 @@ def extract_from_text(soup: BeautifulSoup) -> dict | None:
             scope = scope.parent
     if not results:
         return None
-    # Prefer the smallest price among detected cards (list pages often show
-    # 'starting from' prices); otherwise return the first coherent result.
     return min(results, key=lambda r: r["total_price"])
 
 

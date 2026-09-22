@@ -1,13 +1,21 @@
 """Automatic SKU matching: game + effective units.
 
 A competitor package matches a DANA SKU when both belong to the same game and
-the effective unit totals are equal (base + bonus). Manual overrides in
-source_sku_mappings.sku_id always win over automatic matching.
+the effective unit totals are equal (base + bonus). Pass products (e.g.
+'Weekly Diamond Pass') have no fixed unit count - they are captured with
+base_units=0 and matched by normalized product name instead. Manual overrides
+in source_sku_mappings.sku_id always win over automatic matching.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+
+
+def normalize_name(name: str) -> str:
+    """'Weekly  Diamond Pass!' -> 'weeklydiamondpass'"""
+    return re.sub(r"[^a-z0-9]+", "", (name or "").lower())
 
 
 @dataclass
@@ -57,12 +65,22 @@ def match_package(
 ) -> MatchResult:
     """Match a competitor package to a canonical SKU.
 
-    Priority: manual override > exact effective-unit match > no match.
+    Priority: manual override > pass-name match (base_units=0) >
+    exact effective-unit match > no match.
     """
     if manual_sku_id is not None:
         for sku in skus:
             if sku.id == manual_sku_id:
                 return MatchResult(sku=sku, candidates=[sku])
+        return MatchResult(sku=None, candidates=[])
+
+    # Pass products: match on normalized product name (units are unknown).
+    if package.base_units == 0:
+        target = normalize_name(package.product_name)
+        if target:
+            for sku in skus:
+                if sku.base_units == 0 and normalize_name(sku.display_name) == target:
+                    return MatchResult(sku=sku, candidates=[sku])
         return MatchResult(sku=None, candidates=[])
 
     candidates = [s for s in skus if s.effective_units == package.effective_units]
