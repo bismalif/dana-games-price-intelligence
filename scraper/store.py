@@ -42,6 +42,20 @@ class Store:
             or []
         )
 
+    def delete_broken_named_skus(self, game_id: int) -> int:
+        """Remove SKUs whose display name still contains raw price text
+        (e.g. '5 Diamonds Rp1.150 Rp1.000') - artifacts of an older parser
+        version. Their price logs are kept (sku_id is set to null)."""
+        response = (
+            self.client.table("game_skus")
+            .delete()
+            .eq("game_id", game_id)
+            .filter("display_name", "match", "Rp[0-9]")
+            .select("id")
+            .execute()
+        )
+        return len(response.data or [])
+
     def get_enabled_mappings(self) -> list[dict]:
         """Enabled mappings belonging to enabled sources."""
         response = (

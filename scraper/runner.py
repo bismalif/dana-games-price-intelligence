@@ -64,6 +64,11 @@ def discover_dana_skus(store: Store) -> int:
         if not dana_url:
             continue
         log(f"Discovering DANA SKUs for {game['name']}: {dana_url}")
+        # Remove SKUs left by older parser versions (names containing raw
+        # price text, wrong unit compositions).
+        removed = store.delete_broken_named_skus(game["id"])
+        if removed:
+            log(f"Removed {removed} stale SKU(s) with broken names for {game['name']}")
         try:
             snapshots = open_catalog_pages(dana_url)
         except Exception as exc:
@@ -227,7 +232,7 @@ def scrape_mapping(store: Store, mapping: dict, skus: list[dict]) -> dict:
             if package["base_units"] > 0
             else None
         )
-        insert_success_log(store, mapping, package, matched=True, sku_id=match.sku["id"], eup=eup)
+        insert_success_log(store, mapping, package, matched=True, sku_id=match.sku.id, eup=eup)
         summary["matched_count"] += 1
         summary["matches"].append(
             {

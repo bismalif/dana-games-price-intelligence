@@ -45,6 +45,13 @@ class TestParseUnits(unittest.TestCase):
     def test_base_and_bonus(self):
         self.assertEqual(parse_units("86 Diamonds + 8 Bonus"), (86, 8))
 
+    def test_dana_composition_format(self):
+        # '14 Diamonds (13 + 1 Bonus)' = 14 total as 13 base + 1 bonus.
+        self.assertEqual(parse_units("14 Diamonds (13 + 1 Bonus) Rp5.236 Rp4.760"), (13, 1))
+
+    def test_dana_composition_without_bonus(self):
+        self.assertEqual(parse_units("70 Diamonds (70 + 0 Bonus)"), (70, 0))
+
     def test_base_only(self):
         self.assertEqual(parse_units("70 Diamonds"), (70, 0))
 

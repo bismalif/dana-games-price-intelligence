@@ -25,6 +25,12 @@ from bs4 import BeautifulSoup
 IDR_PRICE_RE = re.compile(r"(?:rp\.?\s*)([0-9][0-9.\s,]{2,})|([0-9][0-9.]{4,})(?:\s*(?:idr|rupiah))", re.IGNORECASE)
 UNITS_RE = re.compile(r"(\d[\d.,]*)\s*(?:diamond|dm|dias|coin|gold|uc|voucher|item|unit)", re.IGNORECASE)
 BONUS_RE = re.compile(r"\+\s*(\d[\d.,]*)\s*(?:bonus|extra|free)?", re.IGNORECASE)
+# DANA catalog format: '14 Diamonds (13 + 1 Bonus)' = total (base + bonus).
+# The parenthesized composition is authoritative, NOT the leading total.
+COMPOSITION_RE = re.compile(
+    r"(\d[\d.,]*)\s*(?:diamonds?|dias|dm)\s*\(\s*(\d[\d.,]*)\s*\+\s*(\d[\d.,]*)\s*bonus\s*\)",
+    re.IGNORECASE,
+)
 
 
 def parse_idr_price(text: str) -> Decimal | None:
@@ -105,16 +111,28 @@ def _to_decimal(raw: str) -> Decimal | None:
 
 
 def parse_units(text: str) -> tuple[int, int] | None:
-    """Extract (base_units, bonus_units) from text like '86 Diamonds + 8 Bonus'.
+    """Extract (base_units, bonus_units) from a product label.
+
+    Supported formats:
+      '86 Diamonds + 8 Bonus'            -> (86, 8)
+      '14 Diamonds (13 + 1 Bonus)'       -> (13, 1)   # DANA: total(base+bonus)
+      '70 Diamonds'                      -> (70, 0)
 
     Returns None when no unit count is found.
     """
     if not text:
         return None
+
+    # DANA-style explicit composition: total (base + bonus).
+    composition = COMPOSITION_RE.search(text)
+    if composition:
+        base = _to_int(composition.group(2))
+        bonus = _to_int(composition.group(3))
+        if base and base > 0 and bonus is not None and 0 <= bonus <= 1_000_000:
+            return base, bonus
+
     unit_match = UNITS_RE.search(text)
     if not unit_match:
-        # Fall back to a leading number (e.g. '86 Diamonds' without keyword
-        # match is handled above; bare '258' titles are too risky to guess).
         return None
     base = _to_int(unit_match.group(1))
     if base is None or base <= 0:
