@@ -75,10 +75,14 @@ def match_package(
         return MatchResult(sku=None, candidates=[])
 
     # Pass products: match on normalized product name (units are unknown).
-    # Containment handles promo suffixes ('Weekly Diamond Pass Sat Set').
+    # Containment handles promo suffixes ('Weekly Diamond Pass Sat Set');
+    # among multiple containment matches, the MOST SPECIFIC (longest) SKU
+    # name wins so 'Weekly Diamond Pass x3' prefers the x3 SKU over x1.
     if package.base_units == 0:
         target = normalize_name(package.product_name)
         if target:
+            best: SkuDefinition | None = None
+            best_length = 0
             for sku in skus:
                 if sku.base_units != 0:
                     continue
@@ -86,7 +90,11 @@ def match_package(
                 if not sku_norm:
                     continue
                 if sku_norm in target or target in sku_norm:
-                    return MatchResult(sku=sku, candidates=[sku])
+                    if len(sku_norm) > best_length:
+                        best = sku
+                        best_length = len(sku_norm)
+            if best is not None:
+                return MatchResult(sku=best, candidates=[best])
         return MatchResult(sku=None, candidates=[])
 
     candidates = [s for s in skus if s.effective_units == package.effective_units]

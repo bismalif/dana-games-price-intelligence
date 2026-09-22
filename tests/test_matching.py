@@ -72,6 +72,18 @@ class TestPassMatching(unittest.TestCase):
         result = match_package(package, UNIQUE_SKUS)
         self.assertIsNone(result.sku)
 
+    def test_pass_variant_prefers_most_specific(self):
+        # 'Weekly Diamond Pass x3' must match the x3 SKU, not the x1 SKU.
+        skus = [
+            SkuDefinition(id=10, sku_code="ff-weekly", display_name="Weekly Diamond Pass",
+                          base_units=0, bonus_units=0),
+            SkuDefinition(id=11, sku_code="ff-weekly-x3", display_name="Weekly Diamond Pass x3",
+                          base_units=0, bonus_units=0),
+        ]
+        package = CandidatePackage("Weekly Diamond Pass x3", base_units=0, bonus_units=0)
+        result = match_package(package, skus)
+        self.assertEqual(result.sku.id, 11)
+
     def test_pass_no_match_leaves_unmatched(self):
         skus = [
             SkuDefinition(id=10, sku_code="mlbb-weekly", display_name="Weekly Diamond Pass",

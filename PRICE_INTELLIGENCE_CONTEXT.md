@@ -246,6 +246,11 @@ python -m scraper.runner                     # one full scrape
 
 ## 12. Known limitations / risks
 
+- **GOGOGO, MobaPay, UniPin Free Fire**: their catalog pages show NO prices
+  in the DOM at all (interaction-gated or image pricing). The mappings stay
+  enabled but fail gracefully each run. To include them, find the direct
+  product-page URLs (where a denomination grid is visible) and update
+  `source_sku_mappings.product_url` via the dashboard Admin tab.
 - Some competitors (SEAGM, PlayAsia, KiosGamer) are seeded DISABLED with
   `requires_auth=true` until authorized access is confirmed. Do not scrape
   login-gated pages without permission.

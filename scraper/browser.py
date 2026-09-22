@@ -20,6 +20,21 @@ GOTO_ATTEMPTS = 2
 # failure entirely.
 LAUNCH_ARGS = ["--disable-http2"]
 
+# Pill labels that must never be clicked - they navigate away from the
+# catalog (buy buttons, auth, external links).
+NAVIGATION_HINTS = (
+    "buy",
+    "beli",
+    "top up",
+    "topup",
+    "checkout",
+    "bayar",
+    "login",
+    "masuk",
+    "daftar",
+    "http",
+)
+
 
 def _settle(page, wait_seconds: float) -> None:
     """Wait for render, then scroll through the page to trigger any lazy
@@ -126,6 +141,8 @@ def open_catalog_pages(
                         continue
                     # Only click things that look like category tabs, not
                     # 'buy' buttons or links that navigate away.
+                    if any(hint in label.lower() for hint in NAVIGATION_HINTS):
+                        continue
                     if not handle.is_visible():
                         continue
                     clicked.add(label.lower())

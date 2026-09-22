@@ -168,24 +168,47 @@ def scrape_mapping(store: Store, mapping: dict, skus: list[dict]) -> dict:
     url = mapping["product_url"]
     log(f"Scraping {source['name']} ({mapping.get('product_label') or ''}): {url}")
     try:
-        with open_page(url) as html:
+        # Click through category pills so hidden groups (Weekly Diamond Pass
+        # etc.) are captured - same treatment as DANA discovery.
+        snapshots = open_catalog_pages(url)
+        packages: list[dict] = []
+        seen: set[tuple] = set()
+        for html in snapshots:
             # 1. Multi-package card extraction (catalog pages).
-            packages = extract_packages(html)
+            for package in extract_packages(html):
+                base = package.get("base_units") or 0
+                if base > 0:
+                    key = ("units", base, package.get("bonus_units", 0))
+                else:
+                    key = ("pass", (package.get("product_name") or "").lower())
+                if key not in seen:
+                    seen.add(key)
+                    packages.append(package)
             # 2. Embedded framework JSON (__NEXT_DATA__ etc.) - catches
             #    Next.js/SPA catalogs whose cards never hydrate headlessly.
             if not packages:
-                packages = extract_from_embedded_json(html)
-            # 3. Single-package chain (JSON-LD / meta / selectors / text).
-            if not packages:
+                for package in extract_from_embedded_json(html):
+                    base = package.get("base_units") or 0
+                    if base > 0:
+                        key = ("units", base, package.get("bonus_units", 0))
+                    else:
+                        key = ("pass", (package.get("product_name") or "").lower())
+                    if key not in seen:
+                        seen.add(key)
+                        packages.append(package)
+        # 3. Single-package chain (JSON-LD / meta / selectors / text).
+        if not packages:
+            with open_page(url) as html:
                 single = extract(html, mapping.get("price_selector"), mapping.get("units_selector"))
                 if single and single.get("base_units") is not None:
                     packages = [single]
-            # 4. Gemini fallback - last resort.
-            if not packages:
-                log(f"Deterministic extraction failed; trying Gemini fallback for {url}")
+        # 4. Gemini fallback - last resort.
+        if not packages:
+            log(f"Deterministic extraction failed; trying Gemini fallback for {url}")
+            with open_page(url) as html:
                 gemini = parse_with_gemini(html, url)
-                if gemini and gemini.get("base_units") is not None:
-                    packages = [gemini]
+            if gemini and gemini.get("base_units") is not None:
+                packages = [gemini]
     except Exception as exc:
         summary["error"] = f"browser error: {exc}"
         store.update_mapping_status(mapping["id"], "failed", str(exc)[:500])

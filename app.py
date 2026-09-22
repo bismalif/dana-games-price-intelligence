@@ -278,10 +278,40 @@ def render_comparison(data: dict) -> None:
 
     undercuts = df["Flag"].str.contains("undercut", na=False).sum()
     stale = df["Flag"].str.contains("stale", na=False).sum() + df["DANA Freshness"].str.contains("stale", na=False).sum()
-    col1, col2, col3 = st.columns(3)
-    col1.metric("Rows shown", len(df))
-    col2.metric("Undercut flags (≥10%)", int(undercuts))
-    col3.metric("Stale indicators", int(stale))
+
+    # Per-SKU verdict: is DANA the cheapest across ALL competitors?
+    sku_verdicts = []
+    for sku_name, group in df.groupby("SKU", sort=False):
+        statuses = group["Status"].tolist()
+        if all("No Data" in s for s in statuses):
+            verdict = "⚪ No competitor data"
+        elif any("Competitor Cheaper" in s for s in statuses):
+            verdict = "🔴 Competitor cheapest"
+        elif any("Price Match" in s for s in statuses) and not any(
+            "DANA Cheaper" in s for s in statuses
+        ):
+            verdict = "⚖️ Tied with competitor"
+        else:
+            verdict = "🟢 DANA cheapest"
+        sku_verdicts.append(
+            {"SKU": sku_name, "Cheapest": verdict, "Competitors compared": len(group)}
+        )
+    verdict_df = pd.DataFrame(sku_verdicts)
+
+    dana_cheapest = (verdict_df["Cheapest"] == "🟢 DANA cheapest").sum()
+    comp_cheapest = (verdict_df["Cheapest"] == "🔴 Competitor cheapest").sum()
+    no_data = (verdict_df["Cheapest"] == "⚪ No competitor data").sum()
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("🟢 DANA cheapest", int(dana_cheapest))
+    col2.metric("🔴 Competitor cheapest", int(comp_cheapest))
+    col3.metric("⚪ No competitor data", int(no_data))
+    col4.metric("Undercut flags (≥10%)", int(undercuts))
+
+    with st.expander("Per-SKU verdict: who is cheapest?", expanded=comp_cheapest > 0):
+        st.dataframe(verdict_df, use_container_width=True, hide_index=True)
+
+    st.caption(f"Stale indicators: {int(stale)}")
 
     styler = df.style.map(
         lambda v: (
