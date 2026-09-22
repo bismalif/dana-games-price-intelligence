@@ -52,6 +52,16 @@ class TestParseUnits(unittest.TestCase):
     def test_dana_composition_without_bonus(self):
         self.assertEqual(parse_units("70 Diamonds (70 + 0 Bonus)"), (70, 0))
 
+    def test_dana_composition_without_bonus_word(self):
+        # Codashop style: '300 Diamonds (150+150)' = 300 total as 150+150.
+        self.assertEqual(
+            parse_units("300 Diamonds (150+150) pengisian pertama! Dari -31%"), (150, 150)
+        )
+
+    def test_unipin_reverse_composition(self):
+        self.assertEqual(parse_units("11 + 1 Diamonds"), (11, 1))
+        self.assertEqual(parse_units("40 + 4 Diamonds Off"), (40, 4))
+
     def test_base_only(self):
         self.assertEqual(parse_units("70 Diamonds"), (70, 0))
 
@@ -182,6 +192,13 @@ class TestFinalPrice(unittest.TestCase):
     def test_clean_product_name(self):
         self.assertEqual(clean_product_name("5 Diamonds Rp1.150 Rp1.000"), "5 Diamonds")
         self.assertEqual(clean_product_name("86 Diamonds + 8 Bonus"), "86 Diamonds + 8 Bonus")
+        self.assertEqual(
+            clean_product_name("Weekly Diamond pass Sat Set Murah"), "Weekly Diamond pass"
+        )
+        self.assertEqual(
+            clean_product_name("100 Diamonds (50+50) pengisian pertama! Dari -31%"),
+            "100 Diamonds (50+50)",
+        )
 
 
 class TestExtractPackages(unittest.TestCase):

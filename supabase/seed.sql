@@ -57,7 +57,7 @@ values
     ((select id from public.sources where slug = 'unipin'), (select id from public.games where slug = 'free-fire'),      'https://www.unipin.com/id/garena-free-fire', 'Free Fire catalog', true, false),
 
     -- GoPay Games (enabled)
-    ((select id from public.sources where slug = 'gopay-games'), (select id from public.games where slug = 'mobile-legends'), 'https://gopay.co.id/games/mobile-legends', 'MLBB catalog', true, false),
+    ((select id from public.sources where slug = 'gopay-games'), (select id from public.games where slug = 'mobile-legends'), 'https://gopay.co.id/games/mobile-legends-bang-bang', 'MLBB catalog', true, false),
     ((select id from public.sources where slug = 'gopay-games'), (select id from public.games where slug = 'free-fire'),      'https://gopay.co.id/games/free-fire', 'Free Fire catalog', true, false),
 
     -- Lapakgaming (enabled)

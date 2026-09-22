@@ -22,15 +22,42 @@ from bs4 import BeautifulSoup
 # Parsing helpers
 # ---------------------------------------------------------------------------
 
-IDR_PRICE_RE = re.compile(r"(?:rp\.?\s*)([0-9][0-9.\s,]{2,})|([0-9][0-9.]{4,})(?:\s*(?:idr|rupiah))", re.IGNORECASE)
+IDR_PRICE_RE = re.compile(
+    r"\b(?:rp|idr)\.?\s*:?\s*([0-9][0-9.\s,]{2,})|([0-9][0-9.]{4,})(?:\s*(?:idr|rupiah))",
+    re.IGNORECASE,
+)
 UNITS_RE = re.compile(r"(\d[\d.,]*)\s*(?:diamond|dm|dias|coin|gold|uc|voucher|item|unit)", re.IGNORECASE)
 BONUS_RE = re.compile(r"\+\s*(\d[\d.,]*)\s*(?:bonus|extra|free)?", re.IGNORECASE)
 # DANA catalog format: '14 Diamonds (13 + 1 Bonus)' = total (base + bonus).
 # The parenthesized composition is authoritative, NOT the leading total.
 COMPOSITION_RE = re.compile(
-    r"(\d[\d.,]*)\s*(?:diamonds?|dias|dm)\s*\(\s*(\d[\d.,]*)\s*\+\s*(\d[\d.,]*)\s*bonus\s*\)",
+    r"(\d[\d.,]*)\s*(?:diamonds?|dias|dm)\s*\(\s*(\d[\d.,]*)\s*\+\s*(\d[\d.,]*)\s*(?:bonus)?\s*\)",
     re.IGNORECASE,
 )
+# UniPin-style composition: '11 + 1 Diamonds' = base + bonus.
+REVERSE_COMPOSITION_RE = re.compile(
+    r"(\d[\d.,]*)\s*\+\s*(\d[\d.,]*)\s*(?:diamonds?|dias|dm)\b",
+    re.IGNORECASE,
+)
+
+# Realistic IDR bounds for game top-ups. Anything outside is a mispaired
+# text fragment (e.g. a page header priced against a unit label), not a
+# real package - rejecting it prevents garbage rows and false alerts.
+MIN_TOTAL_PRICE = Decimal("500")
+MAX_TOTAL_PRICE = Decimal("50000000")
+MIN_PER_UNIT = Decimal("100")
+MAX_PER_UNIT = Decimal("25000")
+
+
+def price_plausible(total: Decimal, base_units: int, bonus_units: int) -> bool:
+    if total < MIN_TOTAL_PRICE or total > MAX_TOTAL_PRICE:
+        return False
+    units = base_units + bonus_units
+    if units > 0:
+        per_unit = total / Decimal(units)
+        if per_unit < MIN_PER_UNIT or per_unit > MAX_PER_UNIT:
+            return False
+    return True
 
 
 def parse_idr_price(text: str) -> Decimal | None:
@@ -62,16 +89,40 @@ def final_idr_price(text: str) -> Decimal | None:
     return prices[-1] if prices else None
 
 
+# Promotional ribbon text that contaminates product labels on catalog cards
+# (e.g. 'Weekly Diamond Pass Sat Set Murah' -> 'Weekly Diamond Pass').
+PROMO_PHRASES = (
+    "sat set",
+    "satset",
+    "special discount",
+    "best seller",
+    "terlaris",
+    "terbaru",
+    "pengisian pertama",
+    "rewards",
+    "promo",
+    "diskon",
+    "murah",
+    "off",
+)
+
+
 def clean_product_name(text: str) -> str:
-    """Strip price amounts and currency tokens from a product label.
+    """Strip price amounts, currency tokens, and promo ribbon text from a
+    product label.
 
     '5 Diamonds Rp1.150 Rp1.000' -> '5 Diamonds'
+    'Weekly Diamond Pass Sat Set Murah' -> 'Weekly Diamond Pass'
+    '100 Diamonds (50+50) pengisian pertama! Dari -31%' -> '100 Diamonds (50+50)'
     """
     if not text:
         return ""
     cleaned = IDR_PRICE_RE.sub(" ", text)
     cleaned = re.sub(r"\b(?:rp|idr|rupiah)\b", " ", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -–—|·,.")
+    cleaned = re.sub(r"\bdari\s*-\s*\d+\s*%", " ", cleaned, flags=re.IGNORECASE)
+    for phrase in PROMO_PHRASES:
+        cleaned = re.sub(rf"\b{re.escape(phrase)}\b", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -–—|·,.!$")
     return cleaned[:200]
 
 
@@ -129,6 +180,14 @@ def parse_units(text: str) -> tuple[int, int] | None:
         base = _to_int(composition.group(2))
         bonus = _to_int(composition.group(3))
         if base and base > 0 and bonus is not None and 0 <= bonus <= 1_000_000:
+            return base, bonus
+
+    # UniPin-style composition: '11 + 1 Diamonds' = base + bonus.
+    reverse = REVERSE_COMPOSITION_RE.search(text)
+    if reverse:
+        base = _to_int(reverse.group(1))
+        bonus = _to_int(reverse.group(2))
+        if base and base > 0 and bonus is not None and 0 <= bonus <= base:
             return base, bonus
 
     unit_match = UNITS_RE.search(text)
@@ -286,7 +345,8 @@ def extract_from_selectors(soup: BeautifulSoup, price_selector: str | None, unit
 # 4. Text heuristics over visible elements
 # ---------------------------------------------------------------------------
 
-PRICE_TEXT_RE = re.compile(r"rp\.?\s*[0-9]", re.IGNORECASE)
+# No trailing \b: 'Rp1.150' has no boundary between 'p' and the digit.
+PRICE_TEXT_RE = re.compile(r"\b(?:rp|idr)\.?\s*:?\s*[0-9]", re.IGNORECASE)
 
 # Pass products have no fixed unit count ('Weekly Diamond Pass'); they are
 # captured with base_units=0 and matched to SKUs by normalized name.
@@ -297,52 +357,87 @@ PASS_RE = re.compile(r"\b(weekly|monthly)\b[\w\s]{0,30}\bpass\b", re.IGNORECASE)
 MAX_CARD_CHARS = 400
 
 
+def _card_scope(node) -> str | None:
+    """Find the smallest ancestor text scope that contains a price AND
+    unit info (or a pass label). Walking up at most 4 levels keeps the
+    scope inside one card; sibling-based layouts (Codashop, GoPay) put
+    the price and the label in adjacent elements under a shared parent.
+    """
+    scope = node
+    for _ in range(4):
+        if scope is None:
+            return None
+        text = scope.get_text(" ", strip=True)
+        if text and PRICE_TEXT_RE.search(text):
+            has_units = parse_units(text) is not None
+            is_pass = PASS_RE.search(text) is not None
+            if (has_units or is_pass) and len(text) <= MAX_CARD_CHARS:
+                return text
+        scope = scope.parent
+    return None
+
+
+def _units_start_position(text: str) -> int | None:
+    """Position of the FIRST unit-composition or unit-keyword match."""
+    for pattern in (COMPOSITION_RE, REVERSE_COMPOSITION_RE, UNITS_RE):
+        match = pattern.search(text)
+        if match:
+            return match.start()
+    return None
+
+
 def extract_packages(html: str) -> list[dict]:
     """Extract EVERY package card from a catalog page.
 
     Card layout: a short text scope containing unit keywords (or a pass
     label) plus one or more IDR amounts. Uses the FINAL (last) price when a
     card shows original + discounted amounts. Deduplicates by unit
-    composition (or pass name).
+    composition (or pass name). Implausible pairings (e.g. a page header
+    priced against a tiny unit label) are rejected.
     """
     soup = BeautifulSoup(html or "", "html.parser")
     packages: list[dict] = []
     seen: set[tuple] = set()
     for el in soup.find_all(string=PRICE_TEXT_RE):
-        container = el.parent
-        if container is None:
+        scope_text = _card_scope(el.parent)
+        if not scope_text:
             continue
-        scope = container
-        for _ in range(3):
-            scope_text = scope.get_text(" ", strip=True)
-            prices = parse_idr_prices(scope_text)
-            units = parse_units(scope_text) if prices else None
-            is_pass = prices and units is None and bool(PASS_RE.search(scope_text))
-            if (units or is_pass) and len(scope_text) <= MAX_CARD_CHARS:
-                if units:
-                    base, bonus = units
-                    key = ("units", base, bonus)
-                else:
-                    base, bonus = 0, 0
-                    key = ("pass", clean_product_name(scope_text).lower())
-                if key not in seen:
-                    seen.add(key)
-                    packages.append(
-                        {
-                            "product_name": clean_product_name(scope_text)
-                            or f"package {base}+{bonus}",
-                            "total_price": prices[-1],  # final price wins
-                            "currency": "IDR",
-                            "base_units": base,
-                            "bonus_units": bonus,
-                            "method": "text_heuristics",
-                            "confidence": 0.6,
-                        }
-                    )
-                break
-            if scope.parent is None:
-                break
-            scope = scope.parent
+        prices = parse_idr_prices(scope_text)
+        if not prices:
+            continue
+        # Real cards lead with the denomination; banners and headers mention
+        # units mid-sentence. Reject late unit mentions. Pass products have
+        # no unit pattern at all - they are exempt from this gate.
+        units_pos = _units_start_position(scope_text)
+        is_pass = units_pos is None and bool(PASS_RE.search(scope_text))
+        if not is_pass and (units_pos is None or units_pos > 60):
+            continue
+        units = parse_units(scope_text)
+        if units:
+            base, bonus = units
+            key = ("units", base, bonus)
+        elif PASS_RE.search(scope_text):
+            base, bonus = 0, 0
+            key = ("pass", clean_product_name(scope_text).lower())
+        else:
+            continue
+        if key in seen:
+            continue
+        final = prices[-1]  # final price wins
+        if not price_plausible(final, base, bonus):
+            continue
+        seen.add(key)
+        packages.append(
+            {
+                "product_name": clean_product_name(scope_text) or f"package {base}+{bonus}",
+                "total_price": final,
+                "currency": "IDR",
+                "base_units": base,
+                "bonus_units": bonus,
+                "method": "text_heuristics",
+                "confidence": 0.6,
+            }
+        )
     return packages
 
 
@@ -365,10 +460,13 @@ def extract_from_text(soup: BeautifulSoup) -> dict | None:
             prices = parse_idr_prices(scope_text)
             units = parse_units(scope_text)
             if units and prices and len(scope_text) <= MAX_CARD_CHARS:
+                final = prices[-1]  # final price wins
+                if not price_plausible(final, units[0], units[1]):
+                    continue
                 results.append(
                     {
                         "product_name": clean_product_name(scope_text),
-                        "total_price": prices[-1],  # final price wins
+                        "total_price": final,
                         "currency": "IDR",
                         "base_units": units[0],
                         "bonus_units": units[1],
@@ -383,6 +481,109 @@ def extract_from_text(soup: BeautifulSoup) -> dict | None:
     if not results:
         return None
     return min(results, key=lambda r: r["total_price"])
+
+
+# ---------------------------------------------------------------------------
+# 5. Embedded framework JSON (__NEXT_DATA__ / __NUXT__)
+# ---------------------------------------------------------------------------
+
+# Sites like GoPay Games are Next.js SPAs whose catalog sometimes never
+# hydrates in headless browsers - but the full product data sits in
+# <script id="__NEXT_DATA__"> as JSON. We walk that tree and derive units
+# from product NAME strings (schema-agnostic), never from arbitrary keys.
+NAME_KEYS = {"name", "title", "productname", "product_name", "label", "itemname", "skuname"}
+PRICE_KEYS = {
+    "price",
+    "sellingprice",
+    "selling_price",
+    "finalprice",
+    "final_price",
+    "saleprice",
+    "sale_price",
+    "discountedprice",
+    "discounted_price",
+    "listprice",
+    "payamount",
+    "pay_amount",
+    "amount",
+}
+
+
+def extract_from_embedded_json(html: str) -> list[dict]:
+    """Extract packages from framework state JSON embedded in the page."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    blobs: list[str] = []
+    for tag in soup.select("script#__NEXT_DATA__, script#__NUXT_DATA__"):
+        if tag.string:
+            blobs.append(tag.string)
+    for script in soup.find_all("script"):
+        text = script.string or ""
+        for marker in ("window.__NUXT__=", "window.__INITIAL_STATE__="):
+            if marker in text:
+                blobs.append(text.split(marker, 1)[1])
+
+    packages: list[dict] = []
+    seen: set[tuple] = set()
+    for blob in blobs:
+        try:
+            data = json.loads(blob[:2_000_000])
+        except Exception:
+            continue
+        for item in _walk_json_products(data):
+            key = (item["base_units"], item["bonus_units"], float(item["total_price"]))
+            if key not in seen:
+                seen.add(key)
+                packages.append(item)
+    return packages
+
+
+def _walk_json_products(node, depth: int = 0) -> list[dict]:
+    """Recursively find dicts that have a name-ish string AND a price-ish
+    number, then derive units from the name text."""
+    found: list[dict] = []
+    if depth > 14:
+        return found
+    if isinstance(node, dict):
+        name = next(
+            (
+                v
+                for k, v in node.items()
+                if k.lower() in NAME_KEYS and isinstance(v, str) and v.strip()
+            ),
+            None,
+        )
+        price = next(
+            (
+                v
+                for k, v in node.items()
+                if k.lower() in PRICE_KEYS and isinstance(v, (int, float)) and not isinstance(v, bool)
+            ),
+            None,
+        )
+        if name is not None and price is not None:
+            units = parse_units(name)
+            is_pass = units is None and bool(PASS_RE.search(name))
+            if units or is_pass:
+                base, bonus = units if units else (0, 0)
+                total = Decimal(str(price))
+                if price_plausible(total, base, bonus):
+                    found.append(
+                        {
+                            "product_name": clean_product_name(name) or f"package {base}+{bonus}",
+                            "total_price": total,
+                            "currency": "IDR",
+                            "base_units": base,
+                            "bonus_units": bonus,
+                            "method": "embedded_json",
+                            "confidence": 0.85,
+                        }
+                    )
+        for value in node.values():
+            found.extend(_walk_json_products(value, depth + 1))
+    elif isinstance(node, list):
+        for value in node[:1000]:
+            found.extend(_walk_json_products(value, depth + 1))
+    return found
 
 
 # ---------------------------------------------------------------------------

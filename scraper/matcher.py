@@ -75,11 +75,17 @@ def match_package(
         return MatchResult(sku=None, candidates=[])
 
     # Pass products: match on normalized product name (units are unknown).
+    # Containment handles promo suffixes ('Weekly Diamond Pass Sat Set').
     if package.base_units == 0:
         target = normalize_name(package.product_name)
         if target:
             for sku in skus:
-                if sku.base_units == 0 and normalize_name(sku.display_name) == target:
+                if sku.base_units != 0:
+                    continue
+                sku_norm = normalize_name(sku.display_name)
+                if not sku_norm:
+                    continue
+                if sku_norm in target or target in sku_norm:
                     return MatchResult(sku=sku, candidates=[sku])
         return MatchResult(sku=None, candidates=[])
 

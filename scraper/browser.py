@@ -21,6 +21,20 @@ GOTO_ATTEMPTS = 2
 LAUNCH_ARGS = ["--disable-http2"]
 
 
+def _settle(page, wait_seconds: float) -> None:
+    """Wait for render, then scroll through the page to trigger any lazy
+    loading (many catalogs only mount package cards when scrolled into
+    view), then return to the top."""
+    page.wait_for_timeout(int(wait_seconds * 1000))
+    try:
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        page.wait_for_timeout(1200)
+        page.evaluate("window.scrollTo(0, 0)")
+        page.wait_for_timeout(600)
+    except Exception:
+        pass
+
+
 @contextmanager
 def open_page(url: str, wait_seconds: float = 3.0, timeout_ms: int = DEFAULT_TIMEOUT_MS):
     """Yield page HTML for a fully-rendered page, then clean up.
@@ -52,7 +66,7 @@ def open_page(url: str, wait_seconds: float = 3.0, timeout_ms: int = DEFAULT_TIM
                     time.sleep(2.0 * attempt)
             if last_error is not None:
                 raise last_error
-            page.wait_for_timeout(int(wait_seconds * 1000))
+            _settle(page, wait_seconds)
             yield page.content()
         finally:
             browser.close()
@@ -95,7 +109,7 @@ def open_catalog_pages(
                     time.sleep(2.0 * attempt)
             if last_error is not None:
                 raise last_error
-            page.wait_for_timeout(int(wait_seconds * 1000))
+            _settle(page, wait_seconds)
             snapshots.append(page.content())
 
             # Click candidate tab/pill elements; capture DOM after each.

@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 from .ai_parser import parse_with_gemini
 from .alerts import send_ops_alert, send_undercut_alert
 from .browser import open_catalog_pages, open_page
-from .extractors import extract, extract_packages
+from .extractors import extract, extract_from_embedded_json, extract_packages
 from .matcher import CandidatePackage, match_package
 from .pricing import effective_unit_price, is_undercutting, undercut_pct
 from .store import Store
@@ -171,12 +171,16 @@ def scrape_mapping(store: Store, mapping: dict, skus: list[dict]) -> dict:
         with open_page(url) as html:
             # 1. Multi-package card extraction (catalog pages).
             packages = extract_packages(html)
-            # 2. Single-package chain (JSON-LD / meta / selectors / text).
+            # 2. Embedded framework JSON (__NEXT_DATA__ etc.) - catches
+            #    Next.js/SPA catalogs whose cards never hydrate headlessly.
+            if not packages:
+                packages = extract_from_embedded_json(html)
+            # 3. Single-package chain (JSON-LD / meta / selectors / text).
             if not packages:
                 single = extract(html, mapping.get("price_selector"), mapping.get("units_selector"))
                 if single and single.get("base_units") is not None:
                     packages = [single]
-            # 3. Gemini fallback - last resort.
+            # 4. Gemini fallback - last resort.
             if not packages:
                 log(f"Deterministic extraction failed; trying Gemini fallback for {url}")
                 gemini = parse_with_gemini(html, url)
