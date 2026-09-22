@@ -56,6 +56,41 @@ class Store:
         )
         return len(response.data or [])
 
+    def prune_miscomposed_skus(self, game_id: int) -> int:
+        """Remove stale SKUs created by older parser versions:
+
+        - unit SKUs whose stored composition contradicts their own display
+          name (e.g. name says '14 Diamonds (13 + 1 Bonus)' = 13+1 but the
+          row stores 14+1);
+        - pass SKUs whose display name still contains promo ribbon text
+          (e.g. 'Weekly Diamond Pass SATSET MURAH') - they would steal
+          matches from their clean counterpart.
+
+        Manually maintained SKUs whose names carry no unit info are kept.
+        """
+        from .extractors import clean_product_name, parse_units
+
+        skus = self.get_skus(game_id)
+        to_delete: list[int] = []
+        for sku in skus:
+            name = sku.get("display_name") or ""
+            if sku.get("base_units", 0) > 0:
+                parsed = parse_units(name)
+                if parsed and tuple(parsed) != (sku["base_units"], sku["bonus_units"]):
+                    to_delete.append(sku["id"])
+            elif clean_product_name(name) != name:
+                to_delete.append(sku["id"])
+        if not to_delete:
+            return 0
+        response = (
+            self.client.table("game_skus")
+            .delete()
+            .in_("id", to_delete)
+            .select("id")
+            .execute()
+        )
+        return len(response.data or [])
+
     def get_enabled_mappings(self) -> list[dict]:
         """Enabled mappings belonging to enabled sources."""
         response = (

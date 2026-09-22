@@ -10,16 +10,20 @@ DingTalk (alerts).
 
 ```
 GitHub Actions (daily 10:00 WIB)
-  Playwright loads each competitor page
-    -> deterministic extraction (JSON-LD / meta / selectors / text)
-    -> Gemini fallback ONLY if that fails (validated strictly)
+  Playwright loads every catalog page and clicks its category pills
+  (hidden groups like Weekly Diamond Pass are captured everywhere)
+    -> multi-package extraction (final/discounted price wins)
+    -> embedded __NEXT_DATA__ JSON for SPA-only catalogs
+    -> Gemini fallback ONLY if those fail (validated strictly)
   -> prices matched to DANA SKUs by game + effective units
+     (pass products matched by most-specific name)
   -> stored in Supabase (price_logs)
   -> undercut state evaluated (>=10% cheaper)
   -> DingTalk group alert on state change
 
 Streamlit Cloud dashboard
-  -> login (Supabase Auth), comparison table, trends, source health,
+  -> login (Supabase Auth), comparison table with per-SKU
+     "who is cheapest" verdict, trends, source health,
      unmatched products, admin config (no code changes needed)
 ```
 
@@ -30,7 +34,8 @@ only when a competitor is at least 10% cheaper AND that state is new.
 ## Setup (one time)
 
 1. **Supabase**: create project -> SQL Editor -> run `supabase/schema.sql`,
-   then `supabase/seed.sql`. Enable Auth -> Email provider.
+   then `supabase/seed.sql`, then everything in `supabase/migrations/`.
+   Enable Auth -> Email provider.
 2. **GitHub**: push this repo to GitHub (private). Add Actions secrets:
    `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `GEMINI_API_KEY`,
    `DINGTALK_WEBHOOK_URL`, `DINGTALK_SECRET`.

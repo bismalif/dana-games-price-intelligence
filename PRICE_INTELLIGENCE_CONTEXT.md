@@ -105,42 +105,85 @@ is_undercutting    = undercut_pct >= 10
 
 Competitor packages are matched to DANA SKUs automatically:
 
-1. Manual override wins if `source_sku_mappings.sku_id` is set.
-2. Otherwise: same game AND equal effective units -> match.
-3. Multiple SKUs with the same effective units -> ambiguous, left unmatched
+1. Manual override wins if `source_sku_mappings.sku_id` is set (single-
+   package pages only - catalog pages match each package individually).
+2. **Pass products** (`base_units = 0`, e.g. `Weekly Diamond Pass`) match by
+   normalized product name with CONTAINMENT, and the **most specific
+   (longest) SKU name wins** - so `Weekly Diamond Pass x3` prefers the x3
+   SKU over x1. Promo suffixes ('...Sat Set Murah') no longer break the
+   match because they are stripped before comparison.
+3. Otherwise: same game AND equal effective units -> match.
+4. Multiple SKUs with the same effective units -> ambiguous, left unmatched
    for manual mapping (visible in the dashboard's Unmatched Products tab).
 
+### Unit composition formats recognized
+
+| Format | Example | Parsed as |
+|---|---|---|
+| DANA explicit | `14 Diamonds (13 + 1 Bonus)` | (13, 1) - total(base+bonus) |
+| Codashop variant | `300 Diamonds (150+150)` | (150, 150) - 'bonus' word optional |
+| UniPin reversed | `11 + 1 Diamonds` | (11, 1) - base + bonus |
+| Plain | `70 Diamonds` | (70, 0) |
+| Pass | `Weekly Diamond Pass` | (0, 0) - name-matched |
+
+### Stale-SKU self-healing
+
+Each DANA discovery run prunes SKUs created by older parser versions:
+rows whose stored composition contradicts their display name (e.g.
+`mobile-legends-14+1` from the old misparse coexisting with the correct
+`mobile-legends-13+1`), and pass rows whose names still contain promo
+ribbon text. Their price logs are kept but detached.
+
 ## 6. Extraction pipeline (scraper/extractors.py, browser.py, ai_parser.py)
+
+### Pill/tab clicking - ALL catalog pages
+
+`browser.open_catalog_pages(url)` loads a page, clicks each visible category
+pill (button / role=tab / class contains tab, pill, chip, category; short
+labels only; buy/login/navigation-looking labels skipped), and returns one
+HTML snapshot per distinct state. Used for **DANA discovery AND every
+competitor mapping** - hidden groups like `Weekly Diamond Pass` are captured
+everywhere. A scroll pass (`_settle`) triggers lazy-loaded cards first.
+
+### Multi-package extraction
+
+`extract_packages(html)` runs on every snapshot: it finds the smallest text
+scope (max 400 chars) containing unit keywords (or a pass label) plus IDR
+amounts, and emits one package per card. Deduplication is by unit
+composition / pass name.
 
 ### Final price rule
 
 Catalog cards often show both an original and a discounted amount
 (`5 Diamonds Rp1.150 Rp1.000`). The **LAST price in the card text is treated
 as the final price** and is what gets stored and compared. Product names are
-cleaned of price text (`5 Diamonds`).
+cleaned of price text and promo ribbon phrases (PROMO_PHRASES: sat set,
+murah, promo, diskon, pengisian pertama, rewards, off, ...) -
+`Weekly Diamond pass Sat Set Murah` -> `Weekly Diamond pass`.
 
-### Multi-package extraction
+### Price sanity bounds
 
-`extract_packages(html)` parses every package card on a catalog page (short
-text scope containing unit keywords or a pass label plus IDR amounts, capped
-at 400 chars so a whole grid is never mistaken for one card). Deduplication
-is by unit composition / pass name.
+Every extracted package must satisfy: total price 500 - 50,000,000 IDR and
+per-unit price 100 - 25,000 IDR (when units > 0). Pairings outside these
+bounds are mispaired text fragments (e.g. a page header priced against a
+unit label) and are rejected - this prevents garbage rows and FALSE
+DingTalk alerts.
 
 ### Pass products (no fixed unit count)
 
 Items like `Weekly Diamond Pass` have no diamond count. They are captured
-with `base_units = 0` and **matched by normalized product name** against DANA
-SKUs discovered the same way. Because they have no per-unit price, they are
-compared by final total price on the dashboard and in alerts.
+with `base_units = 0` and **matched by normalized product name** against
+DANA SKUs discovered the same way (most-specific containment - see section
+5). Because they have no per-unit price, they are compared by final total
+price on the dashboard and in alerts.
 
-### Hidden catalog tabs
+### Embedded framework JSON
 
-Some catalogs hide package groups behind category pills (e.g. DANA's
-`Weekly Diamond Pass` tab). `browser.open_catalog_pages(url)` loads the page,
-clicks each visible pill/label (button / role=tab / class contains tab, pill,
-chip, category - short labels only, navigation-looking labels skipped), and
-returns one HTML snapshot per distinct state. DANA discovery aggregates
-packages across all snapshots.
+Some SPAs (GoPay Games, Lapakgaming) keep their catalog in
+`<script id="__NEXT_DATA__">` / `__NUXT__` state JSON - sometimes the DOM
+never hydrates headlessly at all. `extract_from_embedded_json(html)` walks
+that JSON and derives units from product NAME strings (schema-agnostic,
+never from arbitrary keys), with the same sanity bounds.
 
 ### Single-package chain (product pages)
 
@@ -160,10 +203,15 @@ If all fail -> **Gemini fallback**:
 - Stored with `parser_method='gemini_fallback'` so AI-parsed rows are
   identifiable on the dashboard.
 
-Competitor scraping order per mapping: `extract_packages` (multi) ->
-single-package chain -> Gemini. Each package is matched and logged
-individually; a mapping with zero matches still counts as a healthy scrape
-(rows land in Unmatched Products).
+Competitor scraping order per mapping: multi-package extraction across ALL
+pill snapshots -> embedded JSON -> single-package chain -> Gemini. Each
+package is matched and logged individually; a mapping with zero matches
+still counts as a healthy scrape (rows land in Unmatched Products).
+
+### Price regex breadth
+
+IDR amounts are recognized in all local spellings: `Rp1.150`, `Rp 1.150`,
+`Rp. 1.661`, `IDR 1.674`, `1.674 IDR`.
 
 ## 7. Alerting (scraper/alerts.py)
 
@@ -226,6 +274,17 @@ file.
    Robot -> security = signature -> store webhook + `SEC...` secret in GitHub
    secrets.
 
+### Migrations
+
+Incremental SQL fixes live in `supabase/migrations/` and must be run in the
+SQL Editor after pulling code that adds new ones:
+
+- `001_latest_price_logs_include_dana.sql` - `latest_price_logs` view keys on
+  `mapping_id` OR DANA sku (otherwise DANA logs never reach the dashboard).
+  Also already folded into `schema.sql` for fresh installs.
+- `002_fix_gopay_url_and_cleanup.sql` - GoPay MLBB URL fix, deletion of
+  garbage rows from old parser versions, alert-baseline reset.
+
 ## 11. Operations playbook
 
 | Symptom | Where to look | Fix |
@@ -233,15 +292,19 @@ file.
 | A source always fails | Dashboard > Source Health (`last_error`), Actions logs | Add/adjust CSS selectors via Admin tab; if the site changed layout, update selectors - no code change needed |
 | Many `gemini_fallback` rows | `price_logs.parser_method` | Deterministic parsing broke for that site; add selectors to reduce AI usage |
 | Unmatched products | Dashboard > Unmatched Products | Map them to SKUs in the UI (admin) |
+| SKUs with "No competitor data" that look like duplicates | Table Editor > `game_skus` | Old parser artifacts; the next DANA discovery prunes them automatically (`prune_miscomposed_skus`) |
+| Pass variants (x2/x3) priced wrong | `game_skus` pass rows | Most-specific name matching fixed this; re-run `--dana-only` so DANA's own pass variants are catalogued |
 | No alerts but undercuts visible | `undercut_alert_states` | Expected if state was already `undercutting`, or first-run baseline; check `last_alerted_at` |
 | All data stale | `scrape_runs` | Check the last Actions run; workflow failure sends an ops alert to DingTalk |
-| Dashboard shows nothing | Supabase Auth + RLS | Confirm user exists and email provider enabled; confirm publishable key in Streamlit secrets |
+| Dashboard shows nothing | Supabase Auth + RLS | Confirm user exists and email provider enabled; confirm publishable key in Streamlit secrets; confirm migration 001 ran |
 
 Manual commands:
 
 ```bash
-python -m unittest discover -s tests -t .    # offline tests (no network)
-python -m scraper.runner                     # one full scrape
+python -m unittest discover -s tests -t .                    # offline tests (no network)
+python -m scraper.runner                                     # one full scrape
+python -m scraper.runner --dana-only                         # DANA catalog only (run where dana.id is reachable)
+python -m scraper.runner --competitors-only                  # skip DANA (e.g. CI is IP-blocked)
 ```
 
 ## 12. Known limitations / risks
@@ -269,16 +332,17 @@ python -m scraper.runner                     # one full scrape
 app.py                     Streamlit dashboard (entry point)
 scraper/
   runner.py                orchestration + alert evaluation
-  browser.py               Playwright page loading
-  extractors.py            deterministic parsing chain
+  browser.py               Playwright page loading + pill/tab clicking
+  extractors.py            multi-package + single-package parsing chains
   ai_parser.py             Gemini fallback + validation
-  matcher.py               game + effective-units matching
+  matcher.py               game + effective-units matching, pass names
   pricing.py               Decimal pricing math (shared)
   alerts.py                DingTalk signed webhooks
-  store.py                 Supabase persistence (secret key)
+  store.py                 Supabase persistence (secret key) + SKU pruning
 supabase/
   schema.sql               tables, views, RLS, triggers (run first)
   seed.sql                 games, sources, mappings (run second)
-tests/                     offline unit tests (pricing, matching, alerts)
+  migrations/              incremental SQL fixes (run when added)
+tests/                     offline unit tests (pricing, matching, alerts, extractors)
 .github/workflows/scrape.yml  daily 10:00 WIB scraper + tests
 ```

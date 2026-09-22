@@ -67,8 +67,12 @@ def discover_dana_skus(store: Store) -> int:
         # Remove SKUs left by older parser versions (names containing raw
         # price text, wrong unit compositions).
         removed = store.delete_broken_named_skus(game["id"])
-        if removed:
-            log(f"Removed {removed} stale SKU(s) with broken names for {game['name']}")
+        pruned = store.prune_miscomposed_skus(game["id"])
+        if removed or pruned:
+            log(
+                f"Removed {removed} broken-named and {pruned} miscomposed "
+                f"stale SKU(s) for {game['name']}"
+            )
         try:
             snapshots = open_catalog_pages(dana_url)
         except Exception as exc:
